@@ -1,3 +1,4 @@
+import time
 from src.recommendation import recommend_for_user
 from src.evaluation import train_test_split, precision_at_k
 
@@ -18,6 +19,8 @@ precision = precision_at_k(
     test_movies,
     10
 )
+
+
 
 print("Recommendations:")
 print(

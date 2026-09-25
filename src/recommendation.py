@@ -4,15 +4,26 @@ from database.database import fetch_all
 
 MOVIE_CACHE = None
 RATING_CACHE = None
+POSTER_CACHE = {}
 
 
+def preload_data():
+    get_all_movies()
+    get_movie_rating_stats()
+    
 def get_all_movies():
     global MOVIE_CACHE
 
     if MOVIE_CACHE is None:
         rows = fetch_all("""
-            SELECT movie_id, title, genres
-            FROM movies
+            SELECT 
+                m.movie_id, 
+                m.title, 
+                m.genres,
+                l.tmdb_id
+            FROM movies m
+            LEFT JOIN links l
+                ON m.movie_id = l.movie_id
         """)
 
         MOVIE_CACHE = rows
@@ -33,12 +44,18 @@ def genre_similarity(genres1, genres2):
     return intersection / union
 
 
-def get_content_recommendations(movie_title, n=10):
+def get_content_recommendations(movie_title, n=16):
     target_rows = fetch_all("""
-        SELECT movie_id, title, genres
-        FROM movies
+        SELECT 
+            m.movie_id, 
+            m.title, 
+            m.genres,
+            l.tmdb_id
+        FROM movies m
+        LEFT JOIN links l 
+            ON m.movie_id = l.movie_id
         WHERE title LIKE ?
-        LIMIT 1
+        LIMIT 1 
     """, (f"%{movie_title}%",))
 
     if not target_rows:
@@ -58,7 +75,7 @@ def get_content_recommendations(movie_title, n=10):
 
     results = []
 
-    for movie_id, title, genres in movie_rows:
+    for movie_id, title, genres, tmdb_id in movie_rows:
         if movie_id == target_movie_id:
             continue
 
@@ -71,6 +88,7 @@ def get_content_recommendations(movie_title, n=10):
             "movieId": movie_id,
             "title": title,
             "genres": genres,
+            "tmdb_id": tmdb_id,
             "similarity": similarity
         })
 
@@ -158,11 +176,11 @@ def get_user_rated_movies(user_id):
     return {row[0] for row in rows}
 
 
-def recommend_for_user(movie_title, user_id, n=10, exclude_movies=None):
+def recommend_for_user(movie_title, user_id, n=16, exclude_movies=None):
 
     exclude_movies = set(exclude_movies or [])
 
-    n = min(n, 10)
+    n = min(n, 16)
 
     genre_scores = get_genre_scores(user_id)
 

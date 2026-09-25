@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Movy</title>
+
+    <link
+        rel="stylesheet"
+        href="{{ url_for('static', filename='style.css') }}"
+    >
+</head>
+
+<body>
+
+    <div class="container">
+
+        <header class="header"> 
+            <h1>Movy</h1>
+            <p>Movie recommendations based on your preferences</p>
+        </header>
+
+
+        <form method="POST" class="search-form">
+
+            <input
+                type="text"
+                name="movie"
+                placeholder="Enter a movie..."
+                value="{{ movie or '' }}"
+                required
+            >
+
+            <input
+                type="number"
+                name="user"
+                placeholder="User ID"
+                value="{{ user or '' }}"
+                required
+            >
+
+            <button type="submit">
+                Recommend
+            </button>
+
+        </form>
+
+
+        {% if error %}
+            <div class="error">
+                {{ error }}
+            </div>
+        {% endif %}
+
+
+        {% if recommendations is not none %}
+
+            <section class="results">
+
+                <h2>Recommended Movies</h2>
+
+                <div class="movie-grid">
+
+                    {% for movie in recommendations.iter_rows(named=True) %}
+
+                        <article class="movie-card">
+
+                            <div class="poster-container">
+
+                                <img
+                                    class="movie-poster"
+                                    src="https://placehold.co/500x750?text={{ movie.title | urlencode }}"
+                                    alt="{{ movie.title }}"
+                                >
+
+                            </div>
+
+
+                            <div class="movie-info">
+
+                                <h3>
+                                    {{ movie.title }}
+                                </h3>
+
+                                <p class="genres">
+                                    {{ movie.genres.replace("|", " • ") }}
+                                </p>
+
+                                <div class="score">
+                                    Score:
+                                    {{ "%.3f"|format(movie.final_score) }}
+                                </div>
+
+                            </div>
+
+                        </article>
+
+                    {% endfor %}
+
+                </div>
+
+            </section>
+
+        {% endif %}
+
+    </div>
+
+</body>
+</html>

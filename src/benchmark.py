@@ -6,7 +6,7 @@ from src.recommendation import (
 )
 
 
-user_id = 26
+user_id = 32
 movie_title = "Seven"
 
 rated_movies = get_user_rated_movies(user_id)

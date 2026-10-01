@@ -1,1 +1,1 @@
-DESCRIBE ratings;
+SELECT * FROM movies;

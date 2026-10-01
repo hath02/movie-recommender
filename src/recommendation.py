@@ -1,11 +1,10 @@
 import polars as pl
+import math
 from database.database import fetch_all
-
 
 MOVIE_CACHE = None
 RATING_CACHE = None
 POSTER_CACHE = {}
-
 
 def preload_data():
     get_all_movies()
@@ -18,7 +17,7 @@ def get_all_movies():
         rows = fetch_all("""
             SELECT 
                 m.movie_id, 
-                m.title, 
+                m.title,    
                 m.genres,
                 l.tmdb_id
             FROM movies m
@@ -106,10 +105,9 @@ def get_movie_rating_stats():
         rows = fetch_all("""
             SELECT
                 movie_id,
-                COUNT(*) AS rating_count,
-                AVG(rating) AS average_rating
-            FROM ratings
-            GROUP BY movie_id
+                rating_count,
+                average_rating
+            FROM movie_stats
         """)
 
         RATING_CACHE = pl.DataFrame(

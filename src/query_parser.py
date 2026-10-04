@@ -1,10 +1,20 @@
 import re
 import math
+import json
+import os
+import urllib.request
 import torch
 import torch.nn.functional as F
 import difflib
 from src.recommendation import fetch_all, get_all_movies, get_movie_rating_stats
 
+
+try:
+    LEXICON = json.load(open("models/tag_genre_lexicon.json"))
+except FileNotFoundError:
+    LEXICON = {}
+    
+    
 GENRE_KEYWORDS = {
     "action": "Action", "funny": "Comedy", "comedy": "Comedy",
     "scary": "Horror", "horror": "Horror", "romantic": "Romance",
@@ -16,6 +26,7 @@ GENRE_KEYWORDS = {
 }
 
 # word -> (genres to boost, genres to avoid)
+# this is old and not used anymore, but kept for backwards compatibility with old queries
 MOODS = {
     "dark":        ({"Crime", "Thriller", "Horror"}, {"Comedy", "Children", "Animation"}),
     "darker":      ({"Crime", "Thriller", "Horror"}, {"Comedy", "Children", "Animation"}),
@@ -63,6 +74,13 @@ FILLER = {
 NEGATORS = {"no", "not", "without", "less", "avoid", "hate", "except",
             "nothing", "minus", "fewer", "don", "dont", "never"}
 
+POP_RE = re.compile(
+    r"\b(popular\w*|famous|blockbusters?|mainstream|trending|well-known|"
+    r"obscure|underrated|hidden|gems?|unknown|lesser-known|unpopular|indie|niche)\b"
+)
+OBSCURE_WORDS = {"obscure", "underrated", "hidden", "gem", "gems", "unknown",
+                 "lesser-known", "unpopular", "indie", "niche"}
+
 STOP = {"the", "of", "in", "for", "on", "it", "is", "that", "this", "are",
         "can", "at", "as", "be", "just", "very", "too", "bit", "little",
         "any", "then", "than", "from", "have", "has", "was", "were"}
@@ -74,7 +92,38 @@ _TE = {"emb": None, "m2i": None}
 _TAG_NAMES = set()
 _TAGS = {}  # tags -> {movie_id: score}, filled lazily
 
+_PEOPLE = {}  # movie_id -> [(person_id, name, role)], filled lazily
+_PERSON_MOVIES = {}  # person_id -> [(movie_id, role)], filled lazily
+_LAST = {} # last name -> person_id, filled lazily
+_PERSON_ROLE_MOVIES = {}   # (person_id, role) -> set of movie_ids
 
+_TITLE_SET = set()  # all movie titles, filled lazily
+
+DIRECTOR_CUES = {"directed", "director", "helmed",
+                 "directed by", "by", "filmed by",
+                 "helmed by", "directors", "helmers",
+                 "helmer", "filmmaker", "filmmakers",
+                 "filmmaking", "filmmaker's", "filmmakers'", "helmed by"}
+
+ACTOR_CUES = {"starring", "starred", "stars", 
+              "cast", "featuring", "featuring", 
+              "feats", "with", "acted",
+              "actor", "actress", "performer", "performers",
+              "played", "plays", "portrayed", "portrays"}
+
+
+PERSON_CACHE = "models/person_cache.json"
+try:
+    with open(PERSON_CACHE) as f:
+        _PC = json.load(f)
+except Exception:
+    _PC = {}
+
+_TMDB2MOVIE = {}
+_EXTENDED = set()
+
+    
+    
 def load_mf(path="models/movy_mf.pt"):
     if _MF["emb"] is None:
         try:
@@ -90,6 +139,121 @@ def load_mf(path="models/movy_mf.pt"):
     return _MF
 
 
+def strip_pop(text_lower):
+    return POP_RE.sub(" ", text_lower)
+
+
+def parse_popularity(text):
+    """+1 = wants popular movies, -1 = wants obscure ones, 0 = no preference."""
+    tokens = re.findall(r"[a-z\-]+", text.lower())
+    for i, w in enumerate(tokens):
+        if not POP_RE.fullmatch(w):
+            continue
+        direction = -1 if w in OBSCURE_WORDS else 1
+        if any(x in NEGATORS for x in tokens[max(0, i - 2):i]):
+            direction = -direction          # "less popular" -> obscure
+        return direction
+    return 0
+
+
+def extend_person(pid):
+    if pid in _EXTENDED:
+        return
+    key = str(pid)
+
+    if key not in _PC:
+        api_key = os.environ.get("TMDB_API_KEY")
+        if not api_key:
+            return
+        url = f"https://api.themoviedb.org/3/person/{pid}/movie_credits?api_key={api_key}"
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                d = json.load(r)
+        except Exception as e:
+            print("person fetch failed:", e)
+            return
+        _PC[key] = {
+            "director": [m["id"] for m in d.get("crew", []) if m.get("job") == "Director"],
+            "actor": [m["id"] for m in d.get("cast", []) if m.get("order", 99) < 8],
+        }
+        with open(PERSON_CACHE, "w") as f:
+            json.dump(_PC, f)
+
+    if not _TMDB2MOVIE:
+        for mid, tmdb in fetch_all("SELECT movie_id, tmdb_id FROM links WHERE tmdb_id IS NOT NULL"):
+            _TMDB2MOVIE[int(float(tmdb))] = mid
+
+    for role, tmdb_ids in _PC[key].items():
+        for t in tmdb_ids:
+            mid = _TMDB2MOVIE.get(t)
+            if mid:
+                _PERSON_MOVIES.setdefault(pid, set()).add(mid)
+                _PERSON_ROLE_MOVIES.setdefault((pid, role), set()).add(mid)
+
+    _EXTENDED.add(pid)
+    
+    
+def load_people():
+    if _PEOPLE:
+        return
+    for pid, name in fetch_all("SELECT person_id, name FROM people"):
+        _PEOPLE[name.lower()] = pid
+    for pid, mid, role in fetch_all("SELECT person_id, movie_id, role FROM movie_people"):
+        _PERSON_MOVIES.setdefault(pid, set()).add(mid)
+        _PERSON_ROLE_MOVIES.setdefault((pid, role), set()).add(mid)
+    _TITLE_SET.update(clean_title(m[1]) for m in get_all_movies())
+
+
+def find_people(text_lower):
+    """Returns ([(person_id, role_or_None, negated), ...], text with names/cues removed)."""
+    tokens = re.findall(r"[a-z0-9\-']+", text_lower)
+    used, found = set(), []
+    skip = FILLER | STOP | NEGATORS | DIRECTOR_CUES | ACTOR_CUES
+
+    def add(pid, i, size):
+        role, negated = None, False
+        for j in range(i - 1, max(-1, i - 4), -1):      # up to 3 words before
+            if j in used or tokens[j] in {"but", "and"}:
+                break                                   # don't cross into another clause
+            if tokens[j] in NEGATORS:
+                negated = True
+                used.add(j)
+            elif tokens[j] in DIRECTOR_CUES:
+                role = "director"
+                used.add(j)
+            elif tokens[j] in ACTOR_CUES:
+                role = "actor"
+                used.add(j)
+        found.append((pid, role, negated))
+        used.update(range(i, i + size))
+
+    # pass 1: exact names
+    for size in (4, 3, 2):
+        for i in range(len(tokens) - size + 1):
+            if any(j in used for j in range(i, i + size)):
+                continue
+            phrase = " ".join(tokens[i:i + size])
+            if phrase in _PEOPLE and phrase not in _TITLE_SET:
+                add(_PEOPLE[phrase], i, size)
+
+    # pass 2: fuzzy names ("cillian murp", "cristopher nolan")
+    for size in (3, 2):
+        for i in range(len(tokens) - size + 1):
+            if any(j in used for j in range(i, i + size)):
+                continue
+            if tokens[i] in skip or tokens[i + size - 1] in skip:
+                continue
+            phrase = " ".join(tokens[i:i + size])
+            if len(phrase) < 6 or phrase in _TITLE_SET:
+                continue
+            m = difflib.get_close_matches(phrase, _PEOPLE, n=1, cutoff=0.88)
+            if m:
+                add(_PEOPLE[m[0]], i, size)
+
+    cleaned = " ".join(t for j, t in enumerate(tokens) if j not in used)
+    return found, cleaned
+                
+                            
 def load_tag_emb(path="models/tag_emb.pt"):
     if _TE["emb"] is None:
         try:
@@ -117,7 +281,7 @@ def load_tags():
     if not _TAG_NAMES:
         rows = fetch_all("""
             SELECT tag 
-            FROM movie_tag_scores
+            FROM movie_tag_scores_g
             GROUP BY tag 
             HAVING COUNT(*) >= 20   
         """
@@ -136,7 +300,7 @@ def tag_for(word):
 def tag_score(tag, movie_id):
     if tag not in _TAGS:
         rows = fetch_all(
-            "SELECT movie_id, score FROM movie_tag_scores WHERE tag = ?", (tag,)
+            "SELECT movie_id, score FROM movie_tag_scores_g WHERE tag = ?", (tag,)
         )
         _TAGS[tag] = {m: float(s) for m, s in rows}
         
@@ -196,7 +360,7 @@ def find_movie(text_lower, movies, total):
             titles[name] = movie_id
 
     tokens = re.findall(r"[a-z0-9']+", text_lower)
-    skip = FILLER | set(KEYWORDS)
+    skip = FILLER | NEGATORS | STOP | set(KEYWORDS)
     best_ratio, best_id = 0.0, None
 
     for size in range(1, 5):
@@ -207,7 +371,7 @@ def find_movie(text_lower, movies, total):
             phrase = " ".join(gram)
             if len(phrase) < 4:
                 continue
-            for name in difflib.get_close_matches(phrase, titles, n=1, cutoff=0.8):
+            for name in difflib.get_close_matches(phrase, titles, n=1, cutoff=0.85):
                 ratio = difflib.SequenceMatcher(None, phrase, name).ratio()
                 if ratio > best_ratio:
                     best_ratio, best_id = ratio, titles[name]
@@ -216,17 +380,27 @@ def find_movie(text_lower, movies, total):
 
 
 def parse_query(text, movies, total):
+    load_tags()
     text_lower = text.lower()
-    movie_id = find_movie(text_lower, movies, total)
+    movie_id = find_movie(strip_pop(text_lower), movies, total)
 
     tokens = re.findall(r"[a-z\-]+", text_lower)
     wanted, unwanted = set(), set()
 
     for i, word in enumerate(tokens):
-        if word not in KEYWORDS:
+        tag = None
+        if word not in GENRE_KEYWORDS and word not in FILLER | STOP | NEGATORS and len(word) > 3:
+            tag = tag_for(word)
+
+        if word in GENRE_KEYWORDS:                 # explicit genre: keep the rule
+            want, avoid = KEYWORDS[word]
+        elif tag in LEXICON:                       # learned from data
+            want, avoid = set(LEXICON[tag]["boost"]), set(LEXICON[tag]["avoid"])
+        elif word in KEYWORDS:                     # old MOODS as fallback
+            want, avoid = KEYWORDS[word]
+        else:
             continue
-        want, avoid = KEYWORDS[word]
-        # a negator within the 2 previous words flips the meaning
+
         if any(w in NEGATORS for w in tokens[max(0, i - 2):i]):
             want, avoid = avoid, want
         wanted |= want
@@ -307,6 +481,35 @@ def genre_fallback(movie_id, wanted, unwanted, info, total, avg, n):
     return [t for _, t in scored[:n]]
 
 
+def browse(wanted, unwanted, pop, info, total, avg, n, allowed=None, excluded=None):
+    # used when the user gives no reference movie, e.g. "less popular comedy"
+    scored = []
+    for mid, (_, title, genres, _) in info.items():
+        if allowed is not None and mid not in allowed:
+            continue
+        
+        if excluded and mid in excluded:
+            continue
+        
+        c = total.get(mid, 0)
+        if c < 50:
+            continue
+        if pop < 0 and c > 3000:      # "obscure" = fewer than 3000 ratings
+            continue
+        g = set(genres.split("|"))
+        if unwanted & g:
+            continue
+        if wanted and not (wanted & g):
+            continue
+        a = float(avg.get(mid, 3.5))
+        wr = (c / (c + 100)) * a + (100 / (c + 100)) * 3.5
+        norm = min(1.0, math.log10(c + 1) / 6)       # 0 = unknown, 1 = hugely popular
+        p = norm if pop > 0 else ((1 - norm) if pop < 0 else 0.0)
+        scored.append((0.7 * (wr / 5) + 0.3 * p, title))
+    scored.sort(reverse=True)
+    return [t for _, t in scored[:n]]
+
+
 def recommend_from_text(text, n=16):
     movies = get_all_movies()
     load_mf()
@@ -314,11 +517,36 @@ def recommend_from_text(text, n=16):
     total = dict(zip(stats["movieId"], stats["rating_count"]))
     avg = dict(zip(stats["movieId"], stats["average_rating"]))
 
-    movie_id, wanted, unwanted = parse_query(text, movies, total)
-    if movie_id is None:
-        return []
+    load_people()
+    people, cleaned = find_people(text.lower())
+    text = cleaned if people else text.lower()
 
+    pos_sets, excluded = [], set()
+    for pid, role, negated in people:
+        extend_person(pid)
+        s = (_PERSON_ROLE_MOVIES.get((pid, role), set()) if role else set()) \
+            or _PERSON_MOVIES.get(pid, set())
+        if negated:
+            excluded |= s
+        else:
+            pos_sets.append(s)
+
+    person_movies = set()
+    if pos_sets:
+        person_movies = set.intersection(*pos_sets) or set.union(*pos_sets)
+    person_movies -= excluded
+        
+    movie_id, wanted, unwanted = parse_query(text, movies, total)
+    pop = parse_popularity(text)
     info = {m[0]: m for m in movies}
+    
+    if movie_id is None:
+        if wanted or unwanted or pop or person_movies or excluded:
+            print(f"No reference movie | wanted: {wanted or 'none'} | popularity: {pop} | people: {len(people)} | excluded: {len(excluded)}")
+            allowed = person_movies if person_movies else None
+            return browse(wanted, unwanted, pop, info, total, avg, n, allowed, excluded)
+        return []
+    
     print(f"Matched movie: {info[movie_id][1]}  |  wanted: {wanted or 'none'}  |  unwanted: {unwanted or 'none'}")
     
     load_tags()
@@ -326,10 +554,13 @@ def recommend_from_text(text, n=16):
     print(f"Tags wanted: {want_tags or 'none'} | Tags avoided: {avoid_tags or 'none'}")
 
     rows = get_fans(movie_id)
+    if person_movies:
+        seen = {r[0] for r in rows}
+        rows = list(rows) + [(m, 1) for m in person_movies if m not in seen and m != movie_id]
 
     candidates = []
     for mid, fans in rows:
-        if mid not in info:
+        if mid not in info or mid in excluded:
             continue
 
         genres = set(info[mid][2].split("|"))
@@ -366,7 +597,14 @@ def recommend_from_text(text, n=16):
         else:
             score = 0.45 * (cf / max_cf) + 0.25 * sim + 0.2 * match + 0.1 * (wr / 5)
         score -= 0.4 * bad
-        score += 2.0 * tb - 2.0 * tp
+        score += 0.4 * tb - 0.4 * tp
+        norm = min(1.0, math.log10(total.get(mid, 1) + 1) / 6)       # 0 = unknown, 1 = hugely popular
+        if pop > 0:
+            score += 0.2 * norm
+        elif pop < 0:
+            score += 0.2 * (1 - norm)
+        if mid in person_movies:
+            score += 0.3
         scored.append((score, info[mid][1]))
 
     scored.sort(reverse=True)
